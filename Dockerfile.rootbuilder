@@ -1,0 +1,23 @@
+# syntax = docker/dockerfile:1.3
+
+FROM quay.io/fedora/fedora-minimal:39
+
+ARG IMAGE_VERSION=0
+
+LABEL summary="Bootable Container Image Builder" \
+      description="A Fedora-based environment for building container-based bootable images" \
+      name="rootbuilder" \
+      version="${IMAGE_VERSION}"
+
+RUN --mount=type=cache,sharing=locked,target=/var/cache \
+    microdnf -y install --setopt=keepcache=1 --nodocs \
+        findutils \
+        libzstd \
+        lzo \
+        squashfs-tools-ng \
+        systemd-udev \
+        xz-libs
+
+COPY /rootbuilder/. /
+
+CMD ["/bin/bash", "rootbuilder"]

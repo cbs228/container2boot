@@ -1,0 +1,63 @@
+# syntax = docker/dockerfile:1.3
+
+# or specify your own image with --from
+FROM docker.io/library/almalinux:9
+
+USER root
+
+# Upgrade the image to the basic Server installation, which
+# includes essential tools like NetworkManager / iprutils,
+# ssh, and the like. Also install a kernel image, dracut
+# modules specifically for booting from LiveCDs, and
+# the grub2 bootloader.
+RUN --mount=type=cache,sharing=locked,target=/var/cache \
+    # install packages
+    echo "keepcache=1">>/etc/dnf/dnf.conf && \
+    dnf upgrade -y && \
+    dnf install -y --allowerasing \
+        @Server \
+        dracut-config-generic \
+        dracut-live \
+        dracut-tools \
+        grub2-efi-x64 \
+        grub2-efi-x64-cdboot \
+        grub2-efi-x64-modules \
+        kernel \
+        man \
+        man-pages \
+        shim-x64 && \
+    # unmask all masked services
+    for unit in /etc/systemd/system/*; do \
+        [[ "$unit" -ef /dev/null ]] || continue; \
+        systemctl unmask "$(basename "$unit")"; \
+    done && \
+    # enable services which are disabled by default
+    systemctl enable NetworkManager && \
+    systemctl set-default multi-user.target
+
+RUN --mount=type=secret,id=chpass,required=true \
+    # add users from credentials file
+    while IFS=':' read -r username _ign; do \
+        useradd "$username"; \
+    done <<<$(</run/secrets/chpass) && \
+    # assign passwords so we can log in after we boot.
+    chpasswd </run/secrets/chpass && \
+    # make UID 1000 a sudoer
+    usermod -a -G wheel "$(id -un 1000)" && \
+    # prevent unprivileged users from mounting our boot
+    # media. The partition label is taken from our
+    # rootbuilder script's ROOT_PARTLABEL default
+    echo "PARTLABEL=C2BOOT /boot/efi vfat umask=0077,noauto,nofail,x-udisks-auth 0 1" >>/etc/fstab && \
+    # regenerate the initrd, including support for squashfs
+    # rootfs images with dmsquash-live and support for pulling
+    # rootfs from the network with livenet.
+    #
+    # see dracut.cmdline(7)
+    dracut --no-hostonly --regenerate-all --force \
+        --add "dmsquash-live livenet pollcdrom" && \
+    # delete machine-specific fingerprint information
+    # See: <https://systemd.io/BUILDING_IMAGES/>
+    rm -f /etc/machine-id \
+    rm -f /var/lib/systemd/random-seed \
+    rm -f /var/lib/systemd/credential.secret \
+    rm -f /var/lib/dbus/machine-id

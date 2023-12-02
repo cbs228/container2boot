@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+
+INPUT=/rootfs
+OUTPUT=/out
+
+usage() {
+  cat <<-EOF
+usage: rootbuilder [<options>]
+
+A simple live image creator with an immutable root
+filesystem.
+
+Mount an image to the $INPUT directory and a writable
+filesystem, such as a bind-mounted directory, to $OUTPUT.
+Images will be output to subdirectories like
+$OUTPUT/base
+
+Image Variants
+
+  --base          A kernel, initrd, and rootfs. No
+                  bootloaders. May be used for PXE or
+                  HTTP-based network boots.
+
+Directories
+
+  --input DIR     Set input directory (default: $INPUT)
+  --output DIR    Set output directory (default: $OUTPUT)
+EOF
+}
+
+main() {
+  local options
+  local input="$INPUT"
+  local output="$OUTPUT"
+
+  if ! options="$(getopt -o 'hi:o:' --long help,input:,output:,base -- "$@")"; then
+    err 'invalid arguments'
+    usage >&2
+    return 1
+  fi
+  eval set -- "$options"
+  while true; do
+    case "$1" in
+      (-h | --help)
+        usage
+        return 0 ;;
+      (-i | --input)
+        input="$2"
+        shift ;;
+      (-o | --output)
+        output="$2"
+        shift ;;
+      (--base)
+        # ignored
+        ;;
+      --)
+        shift
+        break ;;
+    esac
+    shift
+  done
+
+  if ! ismount "$input" || [ ! -d "$input/usr" ]; then
+    err \
+      "error: no input image provided.\n\n" \
+      "Use --mount=type=image,src=MYCOOLIMAGE,destination=$input\n" \
+      "to add a source image.\n"
+    usage >&2
+    return 1
+  fi
+
+  if ! ismount "$output"; then
+    err \
+      "error: no output location mounted.\n\n" \
+      "Use --volume ./out:/$output:rw to bind-mount a destination\n" \
+      "directory for output images.\n"
+    usage >&2
+    return 1
+  fi
+
+  umask 002
+  build_base "$input" "$output"
+}
+
+err() {
+  # err MSG...: prints error
+  echo >&2 -e "$@"
+}
+
+die() {
+  # die MSG...: exit with error
+  err "$@"
+  exit 1
+}
+
+ismount() {
+  # ismount DIR: checks if directory is a mount-point
+  grep -qs "$1"' ' /proc/mounts
+}
+
+build_base() {
+  # Builds basic kernel/initrd/rootfs that can be netbooted
+  # Network bootloaders like iPXE or pxelinux are not included.
+  local input="$1"
+  local output="$2/base"
+
+  # detect SELinux `SELABEL_CTX_FILE` containing file labels
+  #   gensquashfs uses the SELinux API to read the labels
+  #   and will automatically read auxiliary files like
+  #   `file_contexts.local` if present.
+  context_base_file="$input/etc/selinux/targeted/contexts/files/file_contexts"
+  selinux_args=()
+  if [ -e "$context_base_file" ]; then
+    selinux_args=(--selinux "$context_base_file")
+  fi
+
+  mkdir -p "$output"
+
+  # copy kernel image and initrd
+  vmlinuz=$(find "$input/boot" -iname 'vmlinuz-*' | sort | head -n1)
+
+  initrd=$(find "$input/boot" -iname 'initramfs-*' -and -not -iname '*-rescue-*' |
+           sort | head -n1)
+
+  cp --no-preserve=all --preserve=timestamps "$vmlinuz" "$output/vmlinuz"
+  cp --no-preserve=all --preserve=timestamps "$initrd" "$output/initrd.img"
+
+  # generate squashfs
+  rm -f -- "$output/squashfs.img"
+  gensquashfs \
+      --pack-dir "$input" \
+      --one-file-system \
+      "${selinux_args[@]}" \
+      "$output/squashfs.img"
+}
+
+# exit if being sourced
+(return 0 2>/dev/null) && return
+
+set -euo pipefail
+main "$@"
