@@ -11,11 +11,14 @@ LABEL summary="Bootable Container Image Builder" \
 
 RUN --mount=type=cache,sharing=locked,target=/var/cache \
     microdnf -y install --setopt=keepcache=1 --nodocs \
+        dosfstools \
         findutils \
         libzstd \
         lzo \
+        mcopy \
         squashfs-tools-ng \
         systemd-udev \
+        util-linux \
         xz-libs
 
 COPY /rootbuilder/. /

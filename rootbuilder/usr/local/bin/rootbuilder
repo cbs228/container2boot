@@ -2,6 +2,12 @@
 
 INPUT=/rootfs
 OUTPUT=/out
+ESP_PARTLABEL="C2BOOT"
+KERNEL_APPEND=""
+SECTOR_SIZE="512"
+IMAGE_SIZE="auto"
+
+declare -g -a ATEXIT_REMOVEFILES=()
 
 usage() {
   cat <<-EOF
@@ -12,19 +18,42 @@ filesystem.
 
 Mount an image to the $INPUT directory and a writable
 filesystem, such as a bind-mounted directory, to $OUTPUT.
-Images will be output to subdirectories like
-$OUTPUT/base
 
 Image Variants
 
-  --base          A kernel, initrd, and rootfs. No
-                  bootloaders. May be used for PXE or
-                  HTTP-based network boots.
+  --esp             A directory which may be copied to an
+                    EFI System Partition (ESP) and then
+                    booted. The kernel, initrd, and rootfs
+                    will be output to the "container2boot"
+                    subdirectory and may also be used for
+                    network boots.
+  --diskimage       Disk image of the above with
+                    systemd-reparted. The output is a
+                    complete GPT partition image file.
+
+OS Options
+
+  --append ARGS     Append these arguments to the kernel
+                    commandline. Enclose multiple arguments
+                    in quotes: --append "quiet nosplash"
+  --rootlabel NAME  Partition label for the root filesystem
+
+Disk Image Options
+
+  --sector-size     Physical device sector size in bytes
+                    for --diskimage builds. Default 512
+  --size            Total image file size in bytes, with
+                    optional K,M,G,T suffixes. For preparing
+                    physical --diskimage, set this to the
+                    total size of your device in
+                    SECTORS * SECTOR_SIZE. Defaults to "auto"
+                    for as small as possible. Size is always
+                    rounded up to a multiple of 4096.
 
 Directories
 
-  --input DIR     Set input directory (default: $INPUT)
-  --output DIR    Set output directory (default: $OUTPUT)
+  --input DIR       Set input directory (default: $INPUT)
+  --output DIR      Set output directory (default: $OUTPUT)
 EOF
 }
 
@@ -32,8 +61,14 @@ main() {
   local options
   local input="$INPUT"
   local output="$OUTPUT"
+  local kernel_append="$KERNEL_APPEND"
+  local esp_partlabel="$ESP_PARTLABEL"
+  local sector_size="$SECTOR_SIZE"
+  local image_size="$IMAGE_SIZE"
+  local want_esp=''
+  local want_diskimg=''
 
-  if ! options="$(getopt -o 'hi:o:' --long help,input:,output:,base -- "$@")"; then
+  if ! options="$(getopt -o 'hi:o:' --long help,input:,output:,esp,diskimage,append,rootlabel,sector-size:,size: -- "$@")"; then
     err 'invalid arguments'
     usage >&2
     return 1
@@ -50,9 +85,24 @@ main() {
       (-o | --output)
         output="$2"
         shift ;;
-      (--base)
-        # ignored
+      (--esp)
+        want_esp=y
         ;;
+      (--diskimage)
+        want_diskimg=y
+        ;;
+      (--append)
+        kernel_append=$(stripspace "$kernel_append $2")
+        shift ;;
+      (--rootlabel)
+        esp_partlabel="$2"
+        shift ;;
+      (--sector-size)
+        sector_size="$2"
+        shift ;;
+      (--size)
+        image_size="$2"
+        shift ;;
       --)
         shift
         break ;;
@@ -79,7 +129,16 @@ main() {
   fi
 
   umask 002
-  build_base "$input" "$output"
+
+  if [[ -n "${want_esp:-}" ||
+       ! -e "$output/esp/container2boot/squashfs.img" ]]; then
+    build_esp "$input" "$output/esp" "$kernel_append" "$esp_partlabel"
+  fi
+
+  if [ "${want_diskimg:-}" ]; then
+    build_diskimg "$output/esp" "$output/disk.img" \
+      "$esp_partlabel" "$sector_size" "$image_size"
+  fi
 }
 
 err() {
@@ -98,11 +157,162 @@ ismount() {
   grep -qs "$1"' ' /proc/mounts
 }
 
-build_base() {
-  # Builds basic kernel/initrd/rootfs that can be netbooted
-  # Network bootloaders like iPXE or pxelinux are not included.
+stripspace() {
+  # stripspace STR: strips leading and trailing whitespace
+  echo "${1#"${1%%[![:space:]]*}"}"
+}
+
+atexit() {
+  # atexit: remove temporary files in ATEXIT_REMOVEFILES
+
+  if [ "${1:-}" = register ]; then
+    trap 'atexit' SIGINT SIGTERM EXIT ERR
+    return
+  fi
+
+  trap '' SIGINT SIGTERM EXIT ERR
+
+  [ -n "${ATEXIT_REMOVEFILES[*]:-}" ] || return
+
+  for destroy in "${ATEXIT_REMOVEFILES[@]}"; do
+    [[ -n "$destroy" && -e "$destroy" ]] || continue
+    rm -rf -- "$destroy" 2>/dev/null || true
+  done
+}
+
+parse_keyvaluefile() {
+  # parse_keyvaluefile OUT: parse a file of key/value shell pairs
+  # like /etc/os-release and write them to the associative array
+  # named OUT.
+  declare -n OUT="$1"
+  local key
+  local val
+  while IFS='=' read -r key val; do
+    eval "declare value=$val"
+    [[ -n "$key" && -n "$value" ]] || continue
+    # shellcheck disable=SC2034,SC2004
+    OUT[$key]="$value"
+  done
+}
+
+make_grub2_config() {
+  # make_grub2_config ROOTFS KERNEL_APPEND ESP_PARTLABEL
+  #
+  # generates a GRUB2 configuration for the mounted ROOTFS
+  # (usually /rootfs). The config will add KERNEL_APPEND to the
+  #  kernel command-line and discover the rootfs by its ESP_PARTLABEL
+  # *partition* label
+
   local input="$1"
-  local output="$2/base"
+  local kernel_append="$2"
+  local esp_partlabel="$3"
+
+  # compute kernel arguments
+  local kernel_cmdline
+  printf -v kernel_cmdline \
+    'root=live:PARTLABEL=%s rd.live.dir=/container2boot rd.live.image rd.live.overlay.readonly %s' \
+    "${esp_partlabel}" \
+    "${kernel_append}"
+  kernel_cmdline="$(stripspace "$kernel_cmdline")"
+
+  # read /etc/os-release
+  declare -A OSREL
+  parse_keyvaluefile <"$input/etc/os-release" OSREL
+  local entry_name="${OSREL[PRETTY_NAME]:-${OSREL[ID]}}"
+
+  # get kernel version
+  local kernel_version
+  kernel_version="$(chroot "$input" rpm -qv kernel)"
+  kernel_version="${kernel_version#kernel*-}"
+
+  # the grub2 config will search the EFI filesystem
+  # it is executing from to find its kernel image
+  cat <<EOF
+set default=0
+
+function load_video {
+  insmod efi_gop
+  insmod efi_uga
+  insmod video_bochs
+  insmod video_cirrus
+  insmod all_video
+}
+
+load_video
+set gfxpayload=keep
+insmod gzio
+insmod part_gpt
+
+set timeout=5
+
+menuentry "Container2Boot $entry_name (${kernel_version})" {
+  linux \$prefix/../../container2boot/vmlinuz ${kernel_cmdline}
+  initrd \$prefix/../../container2boot/initrd.img
+}
+EOF
+}
+
+make_repart_config() {
+  # make_repart_config INPUT OUTPUT ESP_PARTLABEL
+  #
+  # Generates systemd-repart configuration file to pack the
+  # given INPUT directory to the specified OUTPUT location.
+  # The EFI/ESP partition will have the given ESP_PARTLABEL.
+  #
+  # The path to the repart configuration files is printed.
+
+  local input="$1"
+  local output="$2"
+  local esp_partlabel="${3:-$ESP_PARTLABEL}"
+
+  local rootfs="$input/container2boot/squashfs.img"
+  local vmlinuz="$input/container2boot/vmlinuz"
+  local initrd="$input/container2boot/initrd.img"
+  [ -e "$rootfs" ] || die "error: expected rootfs"
+  [ -e "$vmlinuz" ] || die "error: expected kernel"
+  [ -e "$initrd" ] || die "error: expected initrd"
+
+  # create temporary directory
+  local workdir
+  workdir=$(mktemp -d --tmpdir rootbuilder.repart.XXXXXXXXXX)
+  ATEXIT_REMOVEFILES+=("$workdir")
+
+  # generate partition configuration
+  cat >"$workdir/100-efi.conf" <<EOF
+[Partition]
+
+Type=esp
+Format=vfat
+Label=$esp_partlabel
+CopyFiles=$input:/
+Minimize=guess
+EOF
+
+  echo "$workdir"
+}
+
+build_esp() {
+  # build_esp INPUT OUTPUT KERNEL_APPEND ESP_PARTLABEL
+  #
+  # Generates a single EFI/ESP filesystem with a complete Linux system
+  # with its rootfs sourced from INPUT. The INPUT rootfs must have
+  # grub2 and a kernel installed. The filesystem is written to OUTPUT.
+  # The bootloader will have the additional kernel arguments specified
+  # in KERNEL_APPEND, which may be empty. GRUB2 will be configured to
+  # find the esp partition with the given ESP_PARTLABEL GPT *partition*
+  # label. This is not a filesystem label.
+  #
+  # The INPUT root filesystem is compressed using squashfs. GRUB2 will
+  # boot it using dracut's dmsquash-live.
+
+  local input="$1"
+  local output="$2"
+  local kernel_append="${3:-}"
+  local esp_partlabel="${4:-$ESP_PARTLABEL}"
+
+  # detect guest OS
+  declare -A OSREL
+  parse_keyvaluefile <"$input/etc/os-release" OSREL
 
   # detect SELinux `SELABEL_CTX_FILE` containing file labels
   #   gensquashfs uses the SELinux API to read the labels
@@ -114,28 +324,81 @@ build_base() {
     selinux_args=(--selinux "$context_base_file")
   fi
 
-  mkdir -p "$output"
+  rm -rf -- "$output"
+  mkdir -p -- "$output"
+
+  # copy bootloaders
+  cp -R --no-preserve=all --preserve=timestamps "$input/boot/efi/." "$output"
+
+  # where to store grub2 config on the EFI?
+  # ensure this directory exists
+  local grub2_efi_configdir="/EFI/${OSREL[ID]}"
+  [ -d "$output/$grub2_efi_configdir" ] || {
+    err "error: unable to determine directory for grub2 configuration file.\n" \
+      "directory \"$input/boot/efi/$grub2_efi_configdir\" does not exist."
+    return 1
+  }
+
+  # generate the config
+  make_grub2_config \
+    "$input" \
+    "$kernel_append" \
+    "$esp_partlabel"> "$output/$grub2_efi_configdir/grub.cfg"
 
   # copy kernel image and initrd
+  mkdir -p "$output/container2boot"
+
   vmlinuz=$(find "$input/boot" -iname 'vmlinuz-*' | sort | head -n1)
 
   initrd=$(find "$input/boot" -iname 'initramfs-*' -and -not -iname '*-rescue-*' |
            sort | head -n1)
 
-  cp --no-preserve=all --preserve=timestamps "$vmlinuz" "$output/vmlinuz"
-  cp --no-preserve=all --preserve=timestamps "$initrd" "$output/initrd.img"
+  cp --no-preserve=all --preserve=timestamps \
+    "$vmlinuz" "$output/container2boot/vmlinuz"
+  cp --no-preserve=all --preserve=timestamps \
+    "$initrd" "$output/container2boot/initrd.img"
 
   # generate squashfs
-  rm -f -- "$output/squashfs.img"
   gensquashfs \
       --pack-dir "$input" \
       --one-file-system \
       "${selinux_args[@]}" \
-      "$output/squashfs.img"
+      "$output/container2boot/squashfs.img"
+}
+
+build_diskimg() {
+  # build_diskimg INPUT OUTPUT ESP_PARTLABEL SECTOR_SIZE IMAGE_SIZE
+  #
+  # Builds a complete GPT disk image with one EFI ESP partition.
+  # The input files are taken from INPUT, and the image is written
+  # to OUTPUT. The disk image will have the given ESP_PARTLABEL
+  # partition label, SECTOR_SIZE (512), and total IMAGE_SIZE (auto).
+
+  local input="$1"
+  local output="$2"
+  local esp_partlabel="${3:-$ESP_PARTLABEL}"
+  local sector_size="${4:-$SECTOR_SIZE}"
+  local image_size="${5:-$IMAGE_SIZE}"
+
+  # create repart and grub2 configuration files
+  local workdir
+  workdir=$(make_repart_config \
+    "$input" "$output" "$esp_partlabel")
+
+  # generate raw disk image
+  rm -rf -- "$output"
+  systemd-repart \
+    --offline=yes \
+    --empty=create \
+    --definitions="$workdir" \
+    --sector-size="$sector_size" \
+    --size="$image_size" \
+    "$output"
 }
 
 # exit if being sourced
 (return 0 2>/dev/null) && return
 
 set -euo pipefail
+atexit register
 main "$@"
